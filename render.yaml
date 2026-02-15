@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: airline-booking-system
+    runtime: docker
+    repo: https://github.com/anshul31901/airline-booking-system
+    branch: master
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: dev
