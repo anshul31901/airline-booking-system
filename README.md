@@ -31,41 +31,88 @@ Domestic flight booking system for same-day travel with **graph-based search**, 
 
 ### Prerequisites
 
-- **Java 17** (verify: `java -version`) — **must be Java 17**, not 21+
-- **Maven 3.9+** (or use the included Maven wrapper)
+- **Java 17** (verify: `java -version`) — **must be exactly Java 17** (Lombok is incompatible with Java 21+)
+- **Maven 3.9+** (included via Maven wrapper — no separate install needed)
 
-> **macOS with multiple JDKs?** Install Java 17: `brew install openjdk@17`
-> The `start-flight-booking` script auto-detects Java 17 if installed.
+### 1. Install Java 17
 
-### 1. Clone & Run (Dev Mode — no database setup needed)
+<details>
+<summary><strong>macOS</strong></summary>
+
+```bash
+# Install SDKMAN (Java version manager)
+curl -s "https://get.sdkman.io" | bash
+source "$HOME/.sdkman/bin/sdkman-init.sh"
+
+# Install and activate Java 17
+sdk install java 17.0.13-tem
+sdk use java 17.0.13-tem
+
+# Verify
+java -version   # should show: openjdk version "17.0.13"
+```
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Download and install [Eclipse Temurin JDK 17](https://adoptium.net/temurin/releases/?version=17) (select Windows x64 `.msi`).
+
+```bash
+java -version   # should show: openjdk version "17.x.x"
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```bash
+# Ubuntu/Debian
+sudo apt install openjdk-17-jdk
+
+# Or use SDKMAN (any distro)
+curl -s "https://get.sdkman.io" | bash
+source "$HOME/.sdkman/bin/sdkman-init.sh"
+sdk install java 17.0.13-tem
+
+# Verify
+java -version   # should show: openjdk version "17.x.x"
+```
+
+</details>
+
+### 2. Clone & Run
 
 ```bash
 git clone https://github.com/anshul31901/airline-booking-system.git
 cd airline-booking-system
+chmod +x start-flight-booking mvnw    # macOS/Linux only
 
-# Linux/Mac
+# macOS/Linux
 ./start-flight-booking
 
 # Windows
 start-flight-booking.cmd
 ```
 
-The app starts on **http://localhost:8080** with an **H2 in-memory database**. Sample data (10 airports, 105 flights, 735 instances) loads automatically.
+The app starts on **http://localhost:8080** with an **H2 in-memory database**. Sample data (10 airports, 105 flights, 735 instances) loads automatically on first run.
 
-### 2. Open Swagger UI
+### 3. Open Swagger UI
 
-Browse to **http://localhost:8080/swagger-ui.html** to explore and test all endpoints interactively.
+Open **http://localhost:8080/swagger-ui.html** in your browser to explore and test all API endpoints interactively.
 
-### 3. Try a Search
+### 4. Try a Search
 
 ```bash
 curl "http://localhost:8080/api/v1/flights/search?origin=DEL&destination=BLR&travelDate=2026-02-20&includeIndirect=true&sortBy=PRICE"
 ```
 
-### 4. Run Tests
+### 5. Run Tests
 
 ```bash
-# Linux/Mac
+# macOS/Linux
 ./mvnw test
 
 # Windows
