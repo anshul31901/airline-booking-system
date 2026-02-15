@@ -106,60 +106,45 @@ docker run --name airline-postgres \
 
 ## System Architecture
 
-```
-                          ┌─────────────────────────────────────────┐
-                          │              Client / Swagger UI         │
-                          └───────────────────┬─────────────────────┘
-                                              │ HTTP (JSON)
-                                              ▼
-                          ┌─────────────────────────────────────────┐
-                          │           REST Controllers               │
-                          │     /api/v1/flights  /api/v1/bookings   │
-                          │    ┌──────────────┐ ┌───────────────┐   │
-                          │    │FlightSearch  │ │  Booking      │   │
-                          │    │Controller    │ │  Controller   │   │
-                          │    │(@Validated)  │ │               │   │
-                          │    └──────┬───────┘ └───────┬───────┘   │
-                          └───────────┼─────────────────┼───────────┘
-                                      │                 │
-                          ┌───────────▼─────────────────▼───────────┐
-                          │           Service Layer                  │
-                          │  ┌────────────────┐ ┌────────────────┐  │
-                          │  │FlightSearch    │ │  Booking       │  │
-                          │  │Service         │ │  Service       │  │
-                          │  │(@Cacheable)    │ │(@Transactional)│  │
-                          │  └────────┬───────┘ └────────┬───────┘  │
-                          │           │                  │          │
-                          │  ┌────────▼───────┐ ┌────────▼───────┐  │
-                          │  │ FlightGraph    │ │SeatInventory   │  │
-                          │  │ (in-memory     │ │Service         │  │
-                          │  │  search)       │ │(pessimistic    │  │
-                          │  │               │ │ locking)       │  │
-                          │  └───────────────┘ └────────┬───────┘  │
-                          └─────────────────────────────┼──────────┘
-                                                        │
-                          ┌─────────────────────────────▼──────────┐
-                          │        Repository Layer (JPA)           │
-                          │  SELECT ... FOR UPDATE on seat_inventory│
-                          └─────────────────────┬──────────────────┘
-                                                │
-                          ┌─────────────────────▼──────────────────┐
-                          │     PostgreSQL (prod) / H2 (dev)        │
-                          └─────────────────────────────────────────┘
+```mermaid
+graph TD
+    Client["Client / Swagger UI"] -->|HTTP JSON| Controllers
 
-  Background:
-  ┌───────────────────────────────────┐
-  │ BookingCleanupService (@Scheduled)│  ← Runs every 2 min
-  │ Expires PENDING bookings          │  ← Releases blocked seats
-  │ past 10-min timeout               │
-  └───────────────────────────────────┘
+    subgraph Controllers ["REST Controllers /api/v1/"]
+        FSC["FlightSearchController<br/>@Validated"]
+        BC["BookingController"]
+    end
 
-  Startup:
-  ┌───────────────────────────────────┐
-  │ DataInitializationService         │  ← @EventListener(ApplicationReadyEvent)
-  │ Seeds 10 airports, 105 flights,   │  ← Runs once if DB is empty
-  │ 735 instances + seat inventories  │
-  └───────────────────────────────────┘
+    subgraph Services ["Service Layer"]
+        FSS["FlightSearchService<br/>@Cacheable"]
+        BS["BookingService<br/>@Transactional"]
+        FG["FlightGraph<br/>(in-memory search)"]
+        SIS["SeatInventoryService<br/>(pessimistic locking)"]
+    end
+
+    subgraph Repos ["Repository Layer (JPA)"]
+        R["SELECT ... FOR UPDATE<br/>on seat_inventories"]
+    end
+
+    DB[("PostgreSQL (prod)<br/>H2 (dev)")]
+
+    FSC --> FSS
+    BC --> BS
+    FSS --> FG
+    BS --> SIS
+    SIS --> R
+    R --> DB
+
+    subgraph Background
+        BCS["BookingCleanupService<br/>@Scheduled every 2 min<br/>Expires PENDING bookings"]
+    end
+
+    subgraph Startup
+        DIS["DataInitializationService<br/>@EventListener<br/>Seeds 10 airports, 105 flights"]
+    end
+
+    BCS --> R
+    DIS --> DB
 ```
 
 ### Layer Responsibilities
@@ -205,52 +190,23 @@ The search uses a **modified K-shortest-paths algorithm with a priority queue** 
 
 ### Search Flow
 
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │                  SEARCH ALGORITHM                        │
-  │                                                          │
-  │  1. Initialize priority queue with origin airport        │
-  │     (ordered by sort strategy cost)                      │
-  │                          │                               │
-  │                          ▼                               │
-  │  2. ┌─── Pop lowest-cost state from queue                │
-  │     │                    │                               │
-  │     │                    ▼                               │
-  │     │    At destination? ──YES──► Add to results         │
-  │     │         │                   (up to K=10)           │
-  │     │         NO                                         │
-  │     │         │                                          │
-  │     │         ▼                                          │
-  │     │    Max hops (2) reached? ──YES──► Skip             │
-  │     │         │                                          │
-  │     │         NO                                         │
-  │     │         │                                          │
-  │     │         ▼                                          │
-  │     │    For each outgoing flight edge:                  │
-  │     │    ┌──────────────────────────────┐                │
-  │     │    │ Filter checks:              │                │
-  │     │    │  - Flight operating? (not    │                │
-  │     │    │    cancelled)               │                │
-  │     │    │  - Seats available? (>=pax) │                │
-  │     │    │  - Same-day valid? (departs │                │
-  │     │    │    after prev arrival)      │                │
-  │     │    │  - Layover >= 90 min?       │                │
-  │     │    │  - No cycle? (airport not   │                │
-  │     │    │    already visited)         │                │
-  │     │    └──────────────┬───────────────┘                │
-  │     │                   │ passed                         │
-  │     │                   ▼                                │
-  │     │    Prune: cost competitive vs best-K for city?     │
-  │     │         │                                          │
-  │     │         YES                                        │
-  │     │         │                                          │
-  │     │         ▼                                          │
-  │     │    Enqueue extended path                           │
-  │     │         │                                          │
-  │     └─────────┘  (repeat until queue empty or K found)   │
-  │                                                          │
-  │  3. Sort results by strategy, return top 10              │
-  └──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["Initialize priority queue<br/>with origin airport"] --> B["Pop lowest-cost<br/>state from queue"]
+    B --> C{At destination?}
+    C -->|YES| D["Add to results<br/>(up to K=10)"]
+    D --> E{K results found<br/>or queue empty?}
+    E -->|NO| B
+    E -->|YES| K["Sort & return top 10"]
+    C -->|NO| F{Max hops = 2<br/>reached?}
+    F -->|YES| B
+    F -->|NO| G["For each outgoing flight edge"]
+    G --> H{"Filter checks:<br/>1. Flight operating?<br/>2. Seats >= passengers?<br/>3. Departs after prev arrival?<br/>4. Layover >= 90 min?<br/>5. No airport cycle?"}
+    H -->|FAIL| G
+    H -->|PASS| I{Cost competitive<br/>vs best-K for city?}
+    I -->|NO| G
+    I -->|YES| J["Enqueue extended path"]
+    J --> B
 ```
 
 ### Search Constraints
@@ -265,29 +221,33 @@ The search uses a **modified K-shortest-paths algorithm with a priority queue** 
 
 ### Sort Strategies (Strategy Pattern)
 
-```
-           ┌──────────────────┐
-           │FlightSortStrategy│ (interface)
-           │  getComparator() │
-           │  getCost()       │
-           └────────┬─────────┘
-                    │
-          ┌─────────┴─────────┐
-          │                   │
-  ┌───────▼────────┐  ┌──────▼─────────┐
-  │PriceSortStrategy│  │DurationSort    │
-  │                │  │Strategy        │
-  │ Primary: price │  │ Primary: time  │
-  │ Tiebreak: time │  │ Tiebreak: price│
-  └────────────────┘  └────────────────┘
-          ▲                   ▲
-          │                   │
-  ┌───────┴───────────────────┴──────┐
-  │ SortStrategyFactory              │
-  │ getStrategy("PRICE") → Price     │
-  │ getStrategy("DURATION") → Dur    │
-  │ (case-insensitive)               │
-  └──────────────────────────────────┘
+```mermaid
+classDiagram
+    class FlightSortStrategy {
+        <<interface>>
+        +getComparator() Comparator~FlightPath~
+        +getCost(FlightPath) int
+    }
+    class PriceSortStrategy {
+        Primary: price
+        Tiebreak: duration
+        +getComparator()
+        +getCost()
+    }
+    class DurationSortStrategy {
+        Primary: duration
+        Tiebreak: price
+        +getComparator()
+        +getCost()
+    }
+    class SortStrategyFactory {
+        +getStrategy(SortType)$ FlightSortStrategy
+        +getStrategy(String)$ FlightSortStrategy
+    }
+
+    FlightSortStrategy <|.. PriceSortStrategy
+    FlightSortStrategy <|.. DurationSortStrategy
+    SortStrategyFactory ..> FlightSortStrategy : creates
 ```
 
 - **`PRICE`** — cheapest total fare first; ties broken by fastest duration
@@ -299,34 +259,19 @@ The search uses a **modified K-shortest-paths algorithm with a priority queue** 
 
 ### State Machine
 
-```
-                    ┌──────────────────────────────────────────────┐
-                    │              BOOKING LIFECYCLE                │
-                    │                                              │
-                    │     ┌─────────────────────────┐              │
-                    │     │    POST /bookings        │              │
-                    │     │    (seats blocked)       │              │
-                    │     └───────────┬─────────────┘              │
-                    │                 │                             │
-                    │                 ▼                             │
-                    │          ┌──────────┐                        │
-                    │          │ PENDING  │ ◄── 10-min expiry set  │
-                    │          └────┬─────┘                        │
-                    │               │                              │
-                    │     ┌─────────┼──────────┐                   │
-                    │     │         │          │                   │
-                    │     ▼         ▼          ▼                   │
-                    │ ┌────────┐ ┌────────┐ ┌─────────┐           │
-                    │ │CONFIRM │ │ CANCEL │ │ EXPIRED │           │
-                    │ │  ED    │ │  LED   │ │  (auto) │           │
-                    │ └────────┘ └────────┘ └─────────┘           │
-                    │  blocked    blocked    blocked               │
-                    │  → booked   → avail   → avail               │
-                    │  (permanent) (released) (cleanup job)        │
-                    │                                              │
-                    │  Cannot be   Cannot be                       │
-                    │  cancelled   re-confirmed                    │
-                    └──────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : POST /bookings<br/>(seats blocked, 10-min expiry)
+
+    PENDING --> CONFIRMED : POST /confirm<br/>blocked → booked
+    PENDING --> CANCELLED : POST /cancel<br/>blocked → available
+    PENDING --> EXPIRED : 10-min timeout<br/>blocked → available<br/>(cleanup job)
+
+    CONFIRMED --> CANCELLED : POST /cancel<br/>(booked seats retained)
+
+    CONFIRMED --> [*]
+    CANCELLED --> [*]
+    EXPIRED --> [*]
 ```
 
 ### State Transitions
@@ -379,17 +324,24 @@ This invariant is validated on every seat operation. Any violation throws an exc
 
 ### Concurrency Control
 
-```
-  Thread A (Book 3 seats)          Thread B (Book 3 seats)
-  ────────────────────             ────────────────────
-  BEGIN TRANSACTION                BEGIN TRANSACTION
-  SELECT ... FOR UPDATE ◄── acquires row lock
-  available=180, block 3           SELECT ... FOR UPDATE ◄── WAITS (locked)
-  available=177, blocked=3                    │
-  COMMIT ──────────────────────►  lock released, reads
-                                  available=177, block 3
-                                  available=174, blocked=6
-                                  COMMIT
+```mermaid
+sequenceDiagram
+    participant A as Thread A (Book 3)
+    participant DB as seat_inventories row
+    participant B as Thread B (Book 3)
+
+    A->>DB: BEGIN TRANSACTION
+    B->>DB: BEGIN TRANSACTION
+    A->>DB: SELECT ... FOR UPDATE
+    Note over A,DB: Lock acquired
+    B->>DB: SELECT ... FOR UPDATE
+    Note over B,DB: BLOCKED (waiting)
+    Note over A,DB: available=180 → 177<br/>blocked=0 → 3
+    A->>DB: COMMIT
+    Note over A,DB: Lock released
+    DB-->>B: Lock acquired
+    Note over B,DB: available=177 → 174<br/>blocked=3 → 6
+    B->>DB: COMMIT
 ```
 
 - **Pessimistic locking** (`SELECT ... FOR UPDATE`) on the `seat_inventories` row
@@ -584,73 +536,88 @@ All errors return a consistent `ErrorResponseDTO`:
 
 ## Entity Relationship Diagram
 
-```
-  ┌──────────────┐         ┌────────────────┐         ┌──────────────┐
-  │   Airport    │         │  FlightRoute   │         │   Airport    │
-  │──────────────│    1    │────────────────│    1    │──────────────│
-  │ id (PK)      │◄────────│ origin_id (FK) │         │ id (PK)      │
-  │ code (UQ)    │         │ dest_id (FK)   │────────►│ code (UQ)    │
-  │ name         │         │ distance_km    │         │ name         │
-  │ city         │         │ est_duration   │         │ city         │
-  │ country      │         │ isActive       │         │ country      │
-  └──────┬───────┘         └────────────────┘         └──────────────┘
-         │
-         │ 1
-         │
-         │ ╔══════════════════════════════════════════════════════════╗
-         │ ║                 Per-Flight Cluster                      ║
-         │ ║                                                         ║
-         │ ║  ┌──────────────────┐                                   ║
-         ▼ ║  │     Flight       │                                   ║
-  ┌──────────║─│──────────────────│                                   ║
-  │      * ║  │ id (PK)          │                                   ║
-  │        ║  │ flight_number(UQ)│                                   ║
-  │        ║  │ origin_id (FK)   │                                   ║
-  │        ║  │ dest_id (FK)     │                                   ║
-  │        ║  │ departure_time   │                                   ║
-  │        ║  │ arrival_time     │                                   ║
-  │        ║  │ duration_minutes │                                   ║
-  │        ║  │ total_seats (180)│                                   ║
-  │        ║  │ base_price       │                                   ║
-  │        ║  │ isActive         │                                   ║
-  │        ║  └────────┬─────────┘                                   ║
-  │        ║           │                                             ║
-  │        ║     ┌─────┴──────┐                                      ║
-  │        ║     │ 1       1  │                                      ║
-  │        ║     ▼            ▼                                      ║
-  │        ║  ┌────────────┐ ┌────────────────┐                      ║
-  │        ║  │Flight      │ │ SeatInventory  │                      ║
-  │        ║  │Instance    │ │────────────────│  ◄── PESSIMISTIC     ║
-  │        ║  │────────────│ │ id (PK)        │      WRITE LOCK      ║
-  │        ║  │ id (PK)    │ │ flight_id (FK) │                      ║
-  │        ║  │ flight_id  │ │ flight_date    │                      ║
-  │        ║  │ flight_date│ │ total_seats    │                      ║
-  │        ║  │ status     │ │ available_seats│                      ║
-  │        ║  │ price      │ │ blocked_seats  │                      ║
-  │        ║  │ dep_dt     │ │ booked_seats   │                      ║
-  │        ║  │ arr_dt     │ │ version        │                      ║
-  │        ║  └────────────┘ └────────────────┘                      ║
-  │        ╚══════════════════════════════════════════════════════════╝
-  │
-  │      *
-  ▼
-  ┌──────────────────┐         ┌──────────────────┐
-  │    Booking       │    *    │   Passenger      │
-  │──────────────────│────────►│──────────────────│
-  │ id (PK)          │         │ id (PK)          │
-  │ booking_ref (UQ) │         │ booking_id (FK)  │
-  │ flight_id (FK)   │         │ name             │
-  │ flight_date      │         │ age              │
-  │ num_passengers   │         │ gender (M/F/O)   │
-  │ status           │         │ id_proof_number  │
-  │ expires_at       │         └──────────────────┘
-  │ version          │
-  └──────────────────┘
+```mermaid
+erDiagram
+    Airport ||--o{ FlightRoute : "origin"
+    Airport ||--o{ FlightRoute : "destination"
+    Airport ||--o{ Flight : "origin/destination"
 
-  Statuses:
-    FlightInstance: SCHEDULED | CANCELLED | DELAYED
-    Booking:        PENDING | CONFIRMED | CANCELLED | EXPIRED
-    Gender:         M (Male) | F (Female) | O (Other)
+    Flight ||--o{ FlightInstance : "per-date instance"
+    Flight ||--o{ SeatInventory : "per-date inventory"
+    Flight ||--o{ Booking : "booked on"
+
+    Booking ||--o{ Passenger : "has"
+
+    Airport {
+        bigint id PK
+        varchar code UK "3-letter IATA"
+        varchar name
+        varchar city
+        varchar country
+    }
+
+    FlightRoute {
+        bigint id PK
+        bigint origin_airport_id FK
+        bigint destination_airport_id FK
+        int distance_km
+        int estimated_duration_minutes
+        boolean is_active
+    }
+
+    Flight {
+        bigint id PK
+        varchar flight_number UK "e.g. 6E-2001"
+        bigint origin_airport_id FK
+        bigint destination_airport_id FK
+        time departure_time
+        time arrival_time
+        int duration_minutes
+        int total_seats "180"
+        decimal base_price
+        boolean is_active
+    }
+
+    FlightInstance {
+        bigint id PK
+        bigint flight_id FK
+        date flight_date
+        enum status "SCHEDULED | CANCELLED | DELAYED"
+        decimal price
+        datetime departure_date_time
+        datetime arrival_date_time
+    }
+
+    SeatInventory {
+        bigint id PK
+        bigint flight_id FK
+        date flight_date
+        int total_seats
+        int available_seats
+        int blocked_seats
+        int booked_seats
+        bigint version "optimistic lock"
+    }
+
+    Booking {
+        bigint id PK
+        varchar booking_reference UK "BK + 8 hex"
+        bigint flight_id FK
+        date flight_date
+        int num_passengers
+        enum status "PENDING | CONFIRMED | CANCELLED | EXPIRED"
+        datetime expires_at
+        bigint version
+    }
+
+    Passenger {
+        bigint id PK
+        bigint booking_id FK
+        varchar name
+        int age
+        enum gender "M | F | O"
+        varchar id_proof_number
+    }
 ```
 
 ### Database Tables & Key Indexes
@@ -676,34 +643,30 @@ passengers     (id, booking_id, name, age, gender, id_proof_number)
 
 ## Design Patterns
 
-```
-  ┌───────────────────────────────────────────────────────────────┐
-  │                    DESIGN PATTERNS MAP                        │
-  │                                                               │
-  │  Strategy ─────── FlightSortStrategy                          │
-  │  (pluggable         ├── PriceSortStrategy                     │
-  │   sort order)       └── DurationSortStrategy                  │
-  │                                                               │
-  │  Factory ──────── SortStrategyFactory                         │
-  │  (resolve from      getStrategy("PRICE") → PriceSortStrategy  │
-  │   user input)       getStrategy("DURATION") → DurationSort    │
-  │                                                               │
-  │  Template Method ─ SeatInventory                              │
-  │  (state transitions   blockSeats() → validate → update        │
-  │   with validation)    confirmSeats() → validate → update      │
-  │                       releaseBlockedSeats() → validate → upd  │
-  │                                                               │
-  │  Observer ─────── DataInitializationService                   │
-  │  (startup hook)     @EventListener(ApplicationReadyEvent)     │
-  │                                                               │
-  │  Repository ───── Spring Data JPA repositories                │
-  │  (data access       FlightRepository, BookingRepository, etc. │
-  │   abstraction)                                                │
-  │                                                               │
-  │  Singleton ────── Cached FlightGraph (@Cacheable)             │
-  │  (one instance      Built once, reused across all searches    │
-  │   per lifecycle)                                              │
-  └───────────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph Strategy Pattern
+        FSS["FlightSortStrategy<br/>(interface)"] --> PSS["PriceSortStrategy"]
+        FSS --> DSS["DurationSortStrategy"]
+    end
+
+    subgraph Factory Pattern
+        SSF["SortStrategyFactory"] -.->|creates| FSS
+    end
+
+    subgraph Template Method
+        SI["SeatInventory"] --> BS["blockSeats()<br/>validate → update"]
+        SI --> CS["confirmSeats()<br/>validate → update"]
+        SI --> RS["releaseBlockedSeats()<br/>validate → update"]
+    end
+
+    subgraph Observer Pattern
+        ARE["ApplicationReadyEvent"] --> DIS["DataInitializationService"]
+    end
+
+    subgraph Singleton
+        Cache["@Cacheable"] --> FG["FlightGraph<br/>(built once, reused)"]
+    end
 ```
 
 | Pattern | Where | Why |
@@ -751,29 +714,31 @@ All exceptions are caught by `GlobalExceptionHandler` (`@RestControllerAdvice`):
 
 **10 airports** across India, connected by **22 routes** and **105 daily flights**.
 
-```
-                              ┌─────┐
-                         ┌───►│ JAI │◄───┐
-                         │    └─────┘    │
-                         │               │
-  ┌─────┐    ┌─────┐    │    ┌─────┐    │    ┌─────┐
-  │ GOI │◄──►│ BOM │◄───┼───►│ DEL │◄───┼───►│ CCU │
-  └─────┘    └──┬──┘    │    └──┬──┘    │    └──┬──┘
-                │       │       │       │       │
-  ┌─────┐      │       │       │       │    ┌──▼──┐
-  │ PNQ │◄─────┘       │       │       └───►│ HYD │
-  └─────┘              │       │            └──┬──┘
-                       │    ┌──▼──┐            │
-                       └───►│ BLR │◄───────────┘
-                            └──┬──┘
-                               │
-                            ┌──▼──┐
-                            │ MAA │
-                            └──┬──┘
-                               │
-                            ┌──▼──┐
-                            │ COK │
-                            └─────┘
+```mermaid
+graph TD
+    DEL["DEL<br/>Delhi<br/>(Hub)"] <--> BOM["BOM<br/>Mumbai<br/>(Hub)"]
+    DEL <--> BLR["BLR<br/>Bangalore<br/>(Hub)"]
+    DEL <--> CCU["CCU<br/>Kolkata"]
+    DEL <--> HYD["HYD<br/>Hyderabad"]
+    DEL <--> JAI["JAI<br/>Jaipur"]
+
+    BOM <--> BLR
+    BOM <--> GOI["GOI<br/>Goa"]
+    BOM <--> PNQ["PNQ<br/>Pune"]
+    BOM <--> JAI
+    BOM <--> HYD
+
+    BLR <--> MAA["MAA<br/>Chennai"]
+    BLR <--> HYD
+
+    MAA <--> COK["COK<br/>Kochi"]
+    MAA <--> HYD
+
+    CCU <--> HYD
+
+    style DEL fill:#ff6b6b,color:#fff
+    style BOM fill:#ff6b6b,color:#fff
+    style BLR fill:#ffa94d,color:#fff
 ```
 
 ### Airports
@@ -896,43 +861,26 @@ Available at `http://localhost:8080/h2-console` when running with `-Dspring-boot
 
 ### High-Level Architecture
 
-```
-                           ┌──────────────┐
-                           │  CDN / API   │
-                           │   Gateway    │
-                           └──────┬───────┘
-                                  │
-                      ┌───────────┼───────────┐
-                      │           │           │
-                ┌─────▼─────┐ ┌──▼──────┐ ┌──▼──────┐
-                │  Search    │ │ Search  │ │ Search  │   ← Stateless, scales horizontally
-                │  Service   │ │ Service │ │ Service │
-                └─────┬──────┘ └────┬────┘ └────┬────┘
-                      │             │            │
-                ┌─────▼─────────────▼────────────▼────┐
-                │          Redis Cluster               │   ← Cached flight graph
-                │   (graph, seat snapshots, hot routes)│      + inventory snapshots
-                └──────────────────────────────────────┘
+```mermaid
+graph TD
+    CDN["CDN / API Gateway"] --> S1["Search Service"]
+    CDN --> S2["Search Service"]
+    CDN --> S3["Search Service"]
 
-                ┌─────────────┐
-                │  Booking    │   ← Fewer instances (300 RPS vs 3K)
-                │  Service    │
-                └──────┬──────┘
-                       │
-                ┌──────▼──────┐
-                │ Kafka /     │   ← Async seat blocking
-                │ RabbitMQ    │     Decouples lock duration from HTTP response
-                └──────┬──────┘
-                       │
-                ┌──────▼──────┐
-                │ PostgreSQL  │   ← Sharded by flight_date
-                │ (Primary)   │     Pessimistic lock per shard
-                └──────┬──────┘
-                       │
-                ┌──────▼──────┐
-                │ PostgreSQL  │   ← Read replicas for booking lookups
-                │ (Replicas)  │
-                └─────────────┘
+    S1 --> Redis["Redis Cluster<br/>(flight graph, seat snapshots,<br/>hot route cache)"]
+    S2 --> Redis
+    S3 --> Redis
+
+    CDN --> BS["Booking Service<br/>(fewer instances, 300 RPS)"]
+    BS --> Kafka["Kafka / RabbitMQ<br/>(async seat blocking)"]
+    Kafka --> PG_Primary[("PostgreSQL Primary<br/>(sharded by flight_date)")]
+    PG_Primary --> PG_Replica[("PostgreSQL Replicas<br/>(read replicas for lookups)")]
+
+    style S1 fill:#4dabf7,color:#fff
+    style S2 fill:#4dabf7,color:#fff
+    style S3 fill:#4dabf7,color:#fff
+    style Redis fill:#ff6b6b,color:#fff
+    style Kafka fill:#ffa94d,color:#fff
 ```
 
 ### Scaling Strategy
