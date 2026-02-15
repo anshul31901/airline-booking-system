@@ -31,8 +31,11 @@ Domestic flight booking system for same-day travel with **graph-based search**, 
 
 ### Prerequisites
 
-- **Java 17+** (verify: `java -version`)
+- **Java 17** (verify: `java -version`) — **must be Java 17**, not 21+
 - **Maven 3.9+** (or use the included Maven wrapper)
+
+> **macOS with multiple JDKs?** Install Java 17: `brew install openjdk@17`
+> The `start-flight-booking` script auto-detects Java 17 if installed.
 
 ### 1. Clone & Run (Dev Mode — no database setup needed)
 
