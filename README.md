@@ -37,14 +37,14 @@ Domestic flight booking system for same-day travel with **graph-based search**, 
 ### 1. Clone & Run (Dev Mode — no database setup needed)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/anshul31901/airline-booking-system.git
 cd airline-booking-system
 
 # Linux/Mac
-./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
+./start-flight-booking
 
 # Windows
-mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=dev
+start-flight-booking.cmd
 ```
 
 The app starts on **http://localhost:8080** with an **H2 in-memory database**. Sample data (10 airports, 105 flights, 735 instances) loads automatically.
